@@ -10,7 +10,7 @@ WORKDIR /app
 
 # Copy only the requirements file first.
 # Docker caches layers. If requirements.txt hasn't changed, this entire
-# layer is served from cache on subsequent builds — much faster.
+# layer is served from cache on subsequent builds ï¿½ much faster.
 COPY requirements.txt .
 
 # Create a virtual environment and install dependencies into it.
@@ -27,7 +27,7 @@ RUN python -m venv /opt/venv && \
 FROM python:3.12-slim AS final
 
 # Create a non-root user to run the application.
-# Running as root inside a container is a security risk — if the process
+# Running as root inside a container is a security risk ï¿½ if the process
 # is compromised, the attacker has root inside the container.
 RUN groupadd --gid 1001 appgroup && \
     useradd --uid 1001 --gid appgroup --shell /bin/bash --create-home appuser
@@ -47,7 +47,7 @@ ENV PATH="/opt/venv/bin:$PATH" \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     COMMIT_SHA=unknown
-    ENVIRONMENT=production
+    ENV ENVIRONMENT=production
 
 # Switch to non-root user
 USER appuser
