@@ -19,7 +19,7 @@ def index():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Flask ECS App</title>
+        <title>Flask ECS App v2</title>
         <style>
             body {{
                 font-family: Arial, sans-serif;
@@ -48,7 +48,7 @@ def index():
     </head>
     <body>
         <div class="card">
-            <h1>Flask ECS App</h1>
+            <h1>Flask ECS App v2</h1>
             <p>Deployed via GitHub Actions ? ECR ? ECS Fargate</p>
             <hr>
             <p><strong>Container Hostname:</strong> {hostname}</p>
@@ -91,3 +91,4 @@ if __name__ == "__main__":
     # When running directly (development), use port 5000
     # In production (Docker), Gunicorn serves the app
     app.run(host="0.0.0.0", port=5000, debug=False)
+
