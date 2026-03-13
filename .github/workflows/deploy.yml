@@ -1,0 +1,186 @@
+# =============================================================================
+# GitHub Actions Workflow: Build ? Push to ECR ? Deploy to ECS Fargate
+# Triggered on every push to the main branch.
+# Uses OIDC for keyless AWS authentication (no stored access keys).
+# =============================================================================
+
+name: Deploy to ECS Fargate
+
+# ---------------------------------------------------------------------------
+# Trigger: Run this workflow on every push to main.
+# Pull requests to main do NOT trigger deployment (they have no OIDC perms).
+# ---------------------------------------------------------------------------
+on:
+  push:
+    branches:
+      - main
+
+# ---------------------------------------------------------------------------
+# Environment Variables
+# Define all configuration at the top so it is easy to update.
+# These are available to all steps in all jobs via ${{ env.VARNAME }}.
+# ---------------------------------------------------------------------------
+env:
+  AWS_REGION:       us-east-2
+  ECR_REPOSITORY:   flask-ecs-app
+  ECS_CLUSTER:      flask-app-cluster
+  ECS_SERVICE:      flask-app-service
+  CONTAINER_NAME:   flask-ecs-app
+  # TASK_DEFINITION_FILE points to the JSON file in your repo.
+  # GitHub Actions will download the *live* task definition at runtime
+  # (see the "Download task definition" step below).
+  TASK_DEFINITION_FILE: task-definition.json
+
+# ---------------------------------------------------------------------------
+# Permissions
+# CRITICAL: The id-token permission is what allows OIDC to work.
+# Without it, GitHub will not generate the JWT needed to call AWS STS.
+# contents: read is needed to checkout the code.
+# ---------------------------------------------------------------------------
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    name: Build, Push, and Deploy
+    runs-on: ubuntu-latest
+
+    steps:
+      # -----------------------------------------------------------------------
+      # Step 1: Checkout the repository source code onto the runner.
+      # -----------------------------------------------------------------------
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # Step 2: Authenticate to AWS using OIDC.
+      #
+      # This action:
+      # 1. Calls the GitHub OIDC endpoint to get a signed JWT
+      # 2. Calls AWS STS AssumeRoleWithWebIdentity with the JWT
+      # 3. Sets AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN
+      #    as environment variables for all subsequent steps
+      #
+      # The role-to-assume must match the IAM role you created in Step 4.
+      # We read it from a repository variable (not a secret) because
+      # the role ARN is not sensitive information.
+      # -----------------------------------------------------------------------
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-session-name: GitHubActions-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # -----------------------------------------------------------------------
+      # Step 3: Log Docker into Amazon ECR.
+      #
+      # This action runs `aws ecr get-login-password` and pipes it to
+      # `docker login` automatically. The registry URL is set as an output
+      # so subsequent steps can reference it with steps.login-ecr.outputs.registry
+      # -----------------------------------------------------------------------
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # -----------------------------------------------------------------------
+      # Step 4: Build the Docker image and push it to ECR.
+      #
+      # Tagging strategy:
+      # - ${{ github.sha }}: the full 40-character Git commit SHA.
+      #   This uniquely identifies every image and enables rollback
+      #   (you always know exactly which commit a running image came from).
+      # - latest: convenience tag for pulling the most recent build.
+      #
+      # We also bake the commit SHA into the image as an environment variable
+      # (COMMIT_SHA) so the app can display it on the /version endpoint.
+      # -----------------------------------------------------------------------
+      - name: Build, tag, and push Docker image to ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          # Build the image, passing the commit SHA as a build arg
+          # The image is tagged with both the commit SHA and "latest"
+          docker build \
+            --build-arg COMMIT_SHA=${IMAGE_TAG} \
+            --tag ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG} \
+            --tag ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest \
+            .
+
+          # Push both tags to ECR
+          docker push ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}
+          docker push ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest
+
+          echo "image=${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}" >> $GITHUB_OUTPUT
+          echo "Built and pushed image: ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+
+      # -----------------------------------------------------------------------
+      # Step 5: Download the current (live) task definition from AWS.
+      #
+      # WHY download instead of using the file in the repo?
+      # The task definition in your repo only has revision 1 baked in.
+      # ECS updates the task definition internally with each deployment
+      # (adding ARNs, revision numbers, etc). We download the live version
+      # so we are working with the complete, accurate definition, then
+      # replace only the container image URI in the next step.
+      # -----------------------------------------------------------------------
+      - name: Download current task definition from ECS
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition ${{ env.CONTAINER_NAME }} \
+            --region ${{ env.AWS_REGION }} \
+            --query taskDefinition \
+            > task-definition-current.json
+          echo "Downloaded current task definition"
+          cat task-definition-current.json
+
+      # -----------------------------------------------------------------------
+      # Step 6: Render a new task definition with the updated image URI.
+      #
+      # This action takes the current task definition JSON and replaces
+      # the "image" field for the specified container with the new image URI.
+      # It outputs the path to a new, modified task definition JSON file.
+      # -----------------------------------------------------------------------
+      - name: Render new ECS task definition with updated image
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition-current.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ steps.build-image.outputs.image }}
+
+      # -----------------------------------------------------------------------
+      # Step 7: Deploy the new task definition to ECS and wait for stability.
+      #
+      # This action:
+      # 1. Registers the new task definition revision in ECS
+      # 2. Updates the ECS service to use the new revision
+      # 3. Waits for the rolling deployment to complete
+      #    (new tasks healthy, old tasks drained and stopped)
+      #
+      # wait-for-service-stability: true means the workflow will fail if
+      # the deployment fails. This is critical for detecting broken deployments.
+      # -----------------------------------------------------------------------
+      - name: Deploy to ECS and wait for stability
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+
+      # -----------------------------------------------------------------------
+      # Step 8: Print deployment summary.
+      # -----------------------------------------------------------------------
+      - name: Print deployment summary
+        run: |
+          echo "=========================================="
+          echo "Deployment complete!"
+          echo "Image: ${{ steps.build-image.outputs.image }}"
+          echo "Commit: ${{ github.sha }}"
+          echo "Deployed by: ${{ github.actor }}"
+          echo "Workflow run: ${{ github.run_id }}"
+          echo "=========================================="
